@@ -1,161 +1,181 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <ACAN2515.h>
 #include <EspUsbHost.h>
-#include <ESP32-TWAI-CAN.hpp>
 
-#define RGB_PIN 48       // WS2812 data pin
-#define TS_HW_BUTTONBOX1_CATEGORY 27 // hardware button box 1 -> lookup on ECU side via lookup curve table thing; 
-#define CANBUS_BUTTONBOX_ADDRESS 0x711 // CANBUS BUTTONBOX
+// MCP2515引脚配置
+static const byte MCP2515_CS = 10;                               // CS引脚
+static const byte MCP2515_INT = 3;                               // 中断引脚
+static const uint32_t QUARTZ_FREQUENCY = 8UL * 1000UL * 1000UL;  // 8MHz晶振
 
+// ACAN2515实例
+ACAN2515 can(MCP2515_CS, SPI, MCP2515_INT);
 
-
-unsigned long tick = 0;
-unsigned long last_tick = 0;
-int gone = 1;
-int color = 0;
-
+// 硬件定义
+#define RGB_PIN 48
+#define TS_HW_BUTTONBOX1_CATEGORY 27
+#define CANBUS_BUTTONBOX_ADDRESS 0x711
 #define CAN_TX 5
 #define CAN_RX 4
-unsigned long notWorking = 0;
-CanFrame rxobdFrame         = {0};
-CanFrame obdFrame         = {0};
 
+// 全局变量
+int gone = 1;
+int color = 0;
+unsigned long notWorking = 0;
+
+// 发送CAN命令函数
 void sendCMD(uint8_t modifier, uint8_t firstKey, uint8_t secondKey) {
   int retry = 5;
+  bool sentSuccessfully = false;
+
+  uint8_t payload[5];
+  payload[0] = 0x5A;                       // 魔法字节
+  payload[1] = 0;                          // 保留
+  payload[2] = TS_HW_BUTTONBOX1_CATEGORY;  // 硬件按钮盒类别
+  payload[3] = secondKey & 0xff;           // 数据
+  payload[4] = firstKey & 0xff;            // 数据
+
+  Serial.printf("Sending CAN frame: secondKey=%02X, firstKey=%02X\n", secondKey, firstKey);
+
+  // 创建CAN消息
+  CANMessage frame;
+  frame.id = CANBUS_BUTTONBOX_ADDRESS;  // CAN总线按钮盒地址
+  frame.ext = false;                    // 标准帧
+  frame.rtr = false;                    // 数据帧
+  frame.len = 5;                        // 数据长度
+  memcpy(frame.data, payload, 5);       // 复制数据
+
+  retry = 5;
   while (retry > 0) {
-    if (ESP32Can.canState()) break;
-    delay(13);
-    Serial.println("retry");
+    if (can.tryToSend(frame)) {
+      Serial.println("CAN frame sent successfully");
+      sentSuccessfully = true;
+      break;
+    }
+    Serial.println("Retry sending CAN frame...");
+    delay(10);
     retry--;
   }
 
-  if (ESP32Can.canState() != 1) { 
-    Serial.println("Can isn't working ?");
+  if (!sentSuccessfully) {
+    Serial.println("Failed to send CAN frame after retries");
     notWorking++;
-    return;
   }
-
-    uint32_t crc32_res;
-    uint8_t payload[5];
-
-    /* This is from the ECU side of grabbing and using this data.
-       This is here for reference only.
-      if (frame.data8[0] == 0x5a && frame.data8[1] == 0 && frame.data8[2] == 27 ) {
-      	button = frame.data8[3] << 8 | frame.data8[4];
-     	  handleButtonBox(hwButtonBox1Lookup(button));
-    }
-  */
- 
-    payload[0] = 0x5A; // magic byte "Z" in hex - used to be "test buttons" marker
-    payload[1] = 0; // reserved
-    payload[2] = TS_HW_BUTTONBOX1_CATEGORY; // hardware button box 1 -> lookup on ECU side via lookup curve table thing;  27 decimal = 0x1B hex
-    payload[3] = secondKey & 0xff; // data
-    payload[4] = firstKey & 0xff; // data
-
-    Serial.printf("sending %02x %02x", secondKey, firstKey);
-    Serial.println();
-  
-    obdFrame.identifier       = CANBUS_BUTTONBOX_ADDRESS; // CANBUS BUTTONBOX address = 0x711 
-    obdFrame.extd             = 0; // standard frame
-    obdFrame.data_length_code = 5; // data length code 5 bytes
-    obdFrame.data[0]          = payload[0]; // Z - test buttons
-    obdFrame.data[1]          = payload[1];    // TS_BUTTONBOX1_CATEGORY = 26, 0x00 0x1A
-    obdFrame.data[2]          = payload[2]; // hardware button box 1 -> lookup on ECU side via lookup curve table thing; 
-    obdFrame.data[3]          = payload[3]; // data 
-    obdFrame.data[4]          = payload[4];  // data
-
-    retry=5;
-    while (retry > 0) {
-      if (ESP32Can.writeFrame(obdFrame, 5)) break;
-      Serial.println("retry");
-      retry--;
-    }
-
-    while (ESP32Can.inRxQueue() > 0) {
-      ESP32Can.readFrame(rxobdFrame, 1);
-    }
 }
 
+
+// USB主机类
 class MyEspUsbHost : public EspUsbHost {
   void onGone(const usb_host_client_event_msg_t *eventMsg) {
     gone = 1;
     Serial.println("device gone");
   };
-  void onReceive(const usb_transfer_t *transfer){
-      if (!transfer->data_buffer) return;
-      int i=0;
-      int modifier = 0;
-      int firstKey = 0;
-      int secondKey = 0;
-      for (i = 0;i<transfer->data_buffer_size && i < 50;i++ ){
-        Serial.printf("%02x ", transfer->data_buffer[i]);
+
+  void onReceive(const usb_transfer_t *transfer) {
+    if (!transfer->data_buffer) return;
+    int i = 0;
+    int modifier = 0;
+    int firstKey = 0;
+    int secondKey = 0;
+
+    for (i = 0; i < transfer->data_buffer_size && i < 50; i++) {
+      Serial.printf("%02x ", transfer->data_buffer[i]);
+    }
+    Serial.println();
+
+    if (transfer->num_bytes > 4 && transfer->data_buffer_size > 4) {
+      modifier = (transfer->data_buffer[0]);
+      firstKey = (transfer->data_buffer[2]);
+      secondKey = (transfer->data_buffer[3]);
+
+      if (firstKey > 0) firstKey += (modifier * 0xff);
+      if (secondKey > 0) secondKey += (modifier * 0xff);
+
+      if (firstKey > 0) {
+        sendCMD(modifier, firstKey & 0xff, (firstKey >> 8) & 0xff);
+      } else if (secondKey > 0) {
+        sendCMD(modifier, secondKey & 0xff, (secondKey >> 8) & 0xff);
       }
-      Serial.println();
-
-      if (transfer->num_bytes > 4 && transfer->data_buffer_size > 4) { // sanity somewhat here
-        modifier  = (transfer->data_buffer[0]);
-        firstKey  = (transfer->data_buffer[2]);
-        secondKey = (transfer->data_buffer[3]);
-
-         if (firstKey > 0) firstKey += (modifier * 0xff);
-         if (secondKey > 0) secondKey += (modifier * 0xff);
-
-
-        // return; // bit of mojibake here
-        if (firstKey > 0) {
-          sendCMD( modifier,  firstKey & 0xff,  (firstKey >> 8) & 0xff);
-        } else if (secondKey > 0) {
-          sendCMD( modifier,  secondKey & 0xff,  (secondKey >> 8) & 0xff);
-        }
-
-      }
+    }
   }
 };
 
 MyEspUsbHost usbHost;
 
+// CAN初始化函数
+bool setupCAN() {
+  Serial.println("Initializing MCP2515...");
+
+  SPI.begin();
+
+  // 配置CAN设置
+  ACAN2515Settings settings(QUARTZ_FREQUENCY, 500UL * 1000UL);  // 500kbps
+  settings.mRequestedMode = ACAN2515Settings::NormalMode;
+
+  const uint16_t errorCode = can.begin(settings, [] {
+    can.isr();
+  });
+
+  if (errorCode == 0) {
+    Serial.println("CAN initialized successfully at 500kbps");
+    return true;
+  } else {
+    Serial.print("CAN initialization error: 0x");
+    Serial.println(errorCode, HEX);
+    return false;
+  }
+}
+
+
+// 处理接收到的CAN帧
+void processCANReceive() {
+  CANMessage rxFrame;
+  while (can.receive(rxFrame)) {
+    // 这里可以处理接收到的CAN帧
+    // 例如：打印接收到的帧信息
+    Serial.print("Received CAN frame ID: 0x");
+    Serial.print(rxFrame.id, HEX);
+    Serial.print(" Data: ");
+    for (int i = 0; i < rxFrame.len; i++) {
+      Serial.printf("%02X ", rxFrame.data[i]);
+    }
+    Serial.println();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-//  delay(500);
-  int i;
-  tick = xTaskGetTickCount();
+  delay(500);
+  Serial.println("ESP32-S3 Car Dashboard with MCP2515 Starting...");
 
-gone = 0;
+  gone = 0;
+
+  // 初始化USB主机
   usbHost.begin();
   usbHost.setHIDLocal(HID_LOCAL_Japan_Katakana);
   usbHost.task();
 
-  ESP32Can.setPins(CAN_TX, CAN_RX);
-  ESP32Can.setRxQueueSize(500);
-  ESP32Can.setTxQueueSize(500);
-  ESP32Can.setSpeed(ESP32Can.convertSpeed(500));
-  while(!ESP32Can.begin());
+  // 初始化CAN
+  if (!setupCAN()) {
+    Serial.println("CAN initialization failed!");
+  } else {
+    Serial.println("CAN initialization successful");
+  }
+
+  // 设置RGB引脚
+  pinMode(RGB_PIN, OUTPUT);
+  digitalWrite(RGB_PIN, LOW);
+
+  Serial.println("Setup complete");
 }
 
 void loop() {
-  while (ESP32Can.inRxQueue() > 0) {
-    ESP32Can.readFrame(rxobdFrame, 0);
-  }
-  if (xTaskGetTickCount() - tick > 1000) {
-    tick = xTaskGetTickCount();
+  // 处理CAN接收
+  processCANReceive();
 
-
-/*  Serial.printf("txq: %d, rxq: %d, rxerr: %d. txerr: %d, rxmis: %d, txmis: %d, buserr: %d, canstate: %d, notWorking: %d", 
-   ESP32Can.inTxQueue(),
-   ESP32Can.inRxQueue(),
-   ESP32Can.rxErrorCounter(),
-   ESP32Can.txErrorCounter(),
-   ESP32Can.rxMissedCounter(),
-   ESP32Can.txFailedCounter(),
-   ESP32Can.busErrCounter(),
-   ESP32Can.canState(), notWorking);
-    Serial.println();
-*/
-
-  if (notWorking > 30 || ESP32Can.busErrCounter() > 30 ) {
-    Serial.print(" busErrCounter - restarting esp");
-    ESP.restart();
-  } 
-}
+  // 处理USB任务
   usbHost.task();
 
+  // 短暂延迟以防止CPU占用过高
+  delay(1);
 }
-
